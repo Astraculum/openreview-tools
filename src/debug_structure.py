@@ -6,7 +6,7 @@ def debug_structure():
     print("Fetching a few submissions...")
     # Fetch just a few notes to inspect structure
     submissions = client.get_notes(
-        invitation='ICLR.cc/2024/Conference/-/Submission',
+        invitation='ICLR.cc/2025/Conference/-/Submission',
         limit=200,
         details='directReplies'
     )
