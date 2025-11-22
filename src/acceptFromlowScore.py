@@ -22,22 +22,30 @@ def save_cache(data, name):
     with open(path, 'wb') as f:
         pickle.dump(data, f)
 
-def find_rebuttal_examples():
+def find_rebuttal_examples(year='2025', conference='ICLR', keywords=None):
+    if keywords is None:
+        keywords = ['diffusion', 'language', 'text', 'transformer', 'llm', 'token']
+
     # 1. Initialize client (connect to API V2)
     client = openreview.api.OpenReviewClient(baseurl='https://api2.openreview.net')
     
-    print("Connecting to ICLR 2025 repository...")
+    print(f"Connecting to {conference} {year} repository...")
+    
+    # Construct invitation ID
+    invitation_id = f'{conference}.cc/{year}/Conference/-/Submission'
+    venue_id_match = f'{conference}.cc/{year}/Conference'
     
     # 2. Get all Accepted papers
     # Try to load submissions from cache
-    submissions = load_cache('submissions.pkl')
+    cache_filename = f'submissions_{conference}_{year}.pkl'
+    submissions = load_cache(cache_filename)
     if not submissions:
-        # ICLR 2025 Submissions contain decision info, we need to filter for venueid containing Accept
+        # Submissions contain decision info, we need to filter for venueid containing Accept
         submissions = client.get_all_notes(
-            invitation='ICLR.cc/2025/Conference/-/Submission',
+            invitation=invitation_id,
             details='directReplies' # Get replies to calculate scores
         )
-        save_cache(submissions, 'submissions.pkl')
+        save_cache(submissions, cache_filename)
     
     accepted_papers = []
     print(f"Retrieved {len(submissions)} submissions, filtering for accepted papers...")
@@ -47,19 +55,19 @@ def find_rebuttal_examples():
         venue = note.content.get('venue', {}).get('value', '')
         venue_id = note.content.get('venueid', {}).get('value', '')
         
-        # ICLR 2025 Accepted papers have venueid 'ICLR.cc/2025/Conference' 
-        # or venue containing 'poster', 'spotlight', 'oral'
-        if venue_id == 'ICLR.cc/2025/Conference' or \
+        # Accepted papers have venueid matching the conference or venue containing 'poster', 'spotlight', 'oral'
+        if venue_id == venue_id_match or \
            any(x in venue.lower() for x in ['poster', 'spotlight', 'oral']):
             accepted_papers.append(note)
 
-    print(f"Found {len(accepted_papers)} accepted papers. Filtering for controversial papers in [Diffusion Language Models]...")
+    print(f"Found {len(accepted_papers)} accepted papers. Filtering for controversial papers with keywords: {keywords}...")
     print("-" * 60)
 
     results = []
     
     # Load reviews cache
-    reviews_cache = load_cache('reviews_cache_v4.pkl') or {}
+    reviews_cache_filename = f'reviews_cache_{conference}_{year}.pkl'
+    reviews_cache = load_cache(reviews_cache_filename) or {}
     reviews_cache_updated = False
 
     keyword_match_count = 0
@@ -75,19 +83,35 @@ def find_rebuttal_examples():
     # 3. Iterate through accepted papers, filter by keywords and scores
     for note in tqdm(accepted_papers):
         try:
-            # A. Keyword filtering (Domain: Diffusion Language Models/Text Diffusion)
+            # A. Keyword filtering
             title = note.content.get('title', {}).get('value', '').lower()
             abstract = note.content.get('abstract', {}).get('value', '').lower()
             text_data = title + " " + abstract
             
-            # Must contain diffusion
-            if 'diffusion' not in text_data:
-                continue
-            # Must contain language/text related words
-            if not any(kw in text_data for kw in ['language', 'text', 'transformer', 'llm', 'token']):
+            # Check if any of the keywords are present
+            # For simplicity, let's assume we want at least one match from the list
+            # Or if the user provided specific logic. 
+            # The original logic was: must contain 'diffusion' AND (language OR text OR ...)
+            # Let's generalize: if keywords are provided, at least one must match.
+            # If the user wants complex logic, they might need a more complex CLI.
+            # For now, let's assume OR logic for the list provided.
+            
+            # However, the original request was specific to "Diffusion Language Models".
+            # Let's try to respect the user's intent. If they pass multiple keywords, maybe they mean AND?
+            # But usually CLI args are OR or simple list.
+            # Let's stick to: if any keyword is in text_data.
+            
+            # Wait, the original code had:
+            # if 'diffusion' not in text_data: continue
+            # if not any(...): continue
+            
+            # Let's change to: check if ALL provided keywords are present? No that's too strict.
+            # Let's check if ANY of the provided keywords are present.
+            if not any(kw.lower() in text_data for kw in keywords):
                 continue
             
             keyword_match_count += 1
+
 
             # B. Get scores and comments
             forum_id = note.id
@@ -224,6 +248,9 @@ def find_rebuttal_examples():
             })
             
     print("Done! Check rebuttal_candidates.csv")
+
+if __name__ == "__main__":
+    find_rebuttal_examples()
 
 
 if __name__ == "__main__":
