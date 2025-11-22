@@ -1,6 +1,25 @@
 import openreview
 from tqdm import tqdm
 import statistics
+import os
+import pickle
+
+CACHE_DIR = 'cache'
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def load_cache(name):
+    path = os.path.join(CACHE_DIR, name)
+    if os.path.exists(path):
+        print(f"Loading {name} from cache...")
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+def save_cache(data, name):
+    path = os.path.join(CACHE_DIR, name)
+    print(f"Saving {name} to cache...")
+    with open(path, 'wb') as f:
+        pickle.dump(data, f)
 
 def find_rebuttal_examples():
     # 1. 初始化客户端 (连接到 API V2)
@@ -9,11 +28,15 @@ def find_rebuttal_examples():
     print("正在连接 ICLR 2024 数据仓库...")
     
     # 2. 获取所有接收(Accept)的论文
-    # ICLR 2024 的 Submission 包含 decision 信息，我们需要筛选 venueid 包含 Accept 的
-    submissions = client.get_all_notes(
-        invitation='ICLR.cc/2024/Conference/-/Submission',
-        details='directReplies' # 获取回复以计算分数
-    )
+    # 尝试从缓存加载 submissions
+    submissions = load_cache('submissions.pkl')
+    if not submissions:
+        # ICLR 2024 的 Submission 包含 decision 信息，我们需要筛选 venueid 包含 Accept 的
+        submissions = client.get_all_notes(
+            invitation='ICLR.cc/2024/Conference/-/Submission',
+            details='directReplies' # 获取回复以计算分数
+        )
+        save_cache(submissions, 'submissions.pkl')
     
     accepted_papers = []
     print(f"共获取 {len(submissions)} 篇投稿，正在筛选接收论文...")
@@ -23,7 +46,10 @@ def find_rebuttal_examples():
         venue = note.content.get('venue', {}).get('value', '')
         venue_id = note.content.get('venueid', {}).get('value', '')
         
-        if 'Accept' in venue or 'Accept' in venue_id:
+        # ICLR 2024 Accepted papers have venueid 'ICLR.cc/2024/Conference' 
+        # or venue containing 'poster', 'spotlight', 'oral'
+        if venue_id == 'ICLR.cc/2024/Conference' or \
+           any(x in venue.lower() for x in ['poster', 'spotlight', 'oral']):
             accepted_papers.append(note)
 
     print(f"共找到 {len(accepted_papers)} 篇接收论文。正在筛选【扩散语言模型】领域的争议文章...")
@@ -31,6 +57,13 @@ def find_rebuttal_examples():
 
     results = []
     
+    # 加载 reviews 缓存
+    reviews_cache = load_cache('reviews_cache.pkl') or {}
+    reviews_cache_updated = False
+
+    keyword_match_count = 0
+    score_match_count = 0
+
     # 3. 遍历接收论文，进行关键词和分数筛选
     for note in tqdm(accepted_papers):
         try:
@@ -45,15 +78,23 @@ def find_rebuttal_examples():
             # 必须包含 语言/文本 相关词
             if not any(kw in text_data for kw in ['language', 'text', 'transformer', 'llm', 'token']):
                 continue
+            
+            keyword_match_count += 1
 
             # B. 获取分数
             # 在 API V2 中，review 通常作为 directReplies 存在，或者需要单独 fetch
             # 这里我们再次确认 review
             forum_id = note.id
-            reviews = client.get_notes(
-                forum=forum_id, 
-                invitation='ICLR.cc/2024/Conference/-/Official_Review'
-            )
+            
+            if forum_id in reviews_cache:
+                reviews = reviews_cache[forum_id]
+            else:
+                reviews = client.get_notes(
+                    forum=forum_id, 
+                    invitation='ICLR.cc/2024/Conference/-/Official_Review'
+                )
+                reviews_cache[forum_id] = reviews
+                reviews_cache_updated = True
             
             if not reviews:
                 continue
@@ -78,6 +119,7 @@ def find_rebuttal_examples():
             is_controversial = avg_score < 6.0 or min_score <= 4
             
             if is_controversial:
+                score_match_count += 1
                 results.append({
                     'title': note.content.get('title', {}).get('value', ''),
                     'url': f"https://openreview.net/forum?id={forum_id}",
@@ -87,7 +129,14 @@ def find_rebuttal_examples():
                 })
                 
         except Exception as e:
+            # print(f"Error processing {note.id}: {e}")
             continue
+
+    if reviews_cache_updated:
+        save_cache(reviews_cache, 'reviews_cache.pkl')
+
+    print(f"\nKeyword matches: {keyword_match_count}")
+    print(f"Score matches: {score_match_count}")
 
     # 4. 输出结果，按分数从低到高排序 (分数越低越难Rebuttal，学习价值越高)
     results.sort(key=lambda x: x['avg_score'])
