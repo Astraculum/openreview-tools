@@ -9,7 +9,7 @@ This tool helps researchers find "Turnaround" papers in OpenReview conferences (
 1.  Clone the repository.
 2.  Install dependencies:
     ```bash
-    pip install openreview-py tqdm
+    uv sync 
     ```
 
 ## Usage
@@ -17,7 +17,7 @@ This tool helps researchers find "Turnaround" papers in OpenReview conferences (
 Run the tool via `main.py` with command-line arguments:
 
 ```bash
-python main.py --year 2025 --conference ICLR --keywords diffusion language text
+uv run main.py --year 2025 --conference ICLR --keywords diffusion language text
 ```
 
 ### Arguments
