@@ -3,6 +3,7 @@ from tqdm import tqdm
 import statistics
 import os
 import pickle
+import csv
 
 CACHE_DIR = 'cache'
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -58,11 +59,18 @@ def find_rebuttal_examples():
     results = []
     
     # Load reviews cache
-    reviews_cache = load_cache('reviews_cache_v2.pkl') or {}
+    reviews_cache = load_cache('reviews_cache_v4.pkl') or {}
     reviews_cache_updated = False
 
     keyword_match_count = 0
     score_match_count = 0
+
+    # Keywords indicating a score increase
+    positive_keywords = [
+        "raised my score", "increase my score", "increasing my score", 
+        "raised my rating", "increase my rating", "updated my score", 
+        "upgrading my rating", "changed my rating"
+    ]
 
     # 3. Iterate through accepted papers, filter by keywords and scores
     for note in tqdm(accepted_papers):
@@ -81,115 +89,141 @@ def find_rebuttal_examples():
             
             keyword_match_count += 1
 
-            # B. Get scores
-            # In API V2, reviews usually exist as directReplies, or need to be fetched separately
-            # Here we double check reviews
+            # B. Get scores and comments
             forum_id = note.id
             
             if forum_id in reviews_cache:
-                reviews = reviews_cache[forum_id]
+                all_forum_notes = reviews_cache[forum_id]
             else:
-                # Fetch all notes in forum to find reviews
-                # We filter for notes that have 'Official_Review' in their invitation
-                all_notes = client.get_notes(forum=forum_id)
-                reviews = [n for n in all_notes if any('Official_Review' in inv for inv in n.invitations)]
-                reviews_cache[forum_id] = reviews
+                # Fetch all notes in forum (Reviews, Meta Reviews, Comments)
+                all_forum_notes = client.get_notes(forum=forum_id)
+                reviews_cache[forum_id] = all_forum_notes
                 reviews_cache_updated = True
             
+            # Extract Reviews and Meta Reviews
+            reviews = [n for n in all_forum_notes if any('Official_Review' in inv for inv in n.invitations)]
+            meta_reviews = [n for n in all_forum_notes if any('Meta_Review' in inv for inv in n.invitations)]
+            
             if keyword_match_count <= 5:
-                print(f"DEBUG: Processing {forum_id}. Reviews count: {len(reviews)}")
+                print(f"DEBUG: Processing {forum_id}. Notes: {len(all_forum_notes)}, Reviews: {len(reviews)}")
 
             if not reviews:
                 continue
                 
-            initial_scores = []
-            final_scores = []
-
+            current_scores = []
             for review in reviews:
-                # ICLR 2025 rating format is usually "8: Strong Accept", extract number before colon
-                # Initial Rating
+                # In OpenReview, the 'rating' field in the Review Note is typically overwritten 
+                # when a reviewer updates their score. Thus, this is the Current/Final score.
                 rating_val = review.content.get('rating', {}).get('value', '')
                 rating_str = str(rating_val) if rating_val is not None else ''
                 
-                # Final Rating (Post-Rebuttal)
-                final_rating_val = review.content.get('final_rating', {}).get('value', '')
-                final_rating_str = str(final_rating_val) if final_rating_val is not None else ''
-
-                if keyword_match_count <= 5:
-                     print(f"DEBUG: id={forum_id} rating='{rating_str}' final='{final_rating_str}'")
-
-                current_initial_score = None
                 if rating_str:
                     try:
-                        # Handle "8: Strong Accept" or just "8"
-                        current_initial_score = int(rating_str.split(':')[0])
-                        initial_scores.append(current_initial_score)
+                        score = int(rating_str.split(':')[0])
+                        current_scores.append(score)
                     except:
                         pass
-                
-                if final_rating_str:
-                    try:
-                        score = int(final_rating_str.split(':')[0])
-                        final_scores.append(score)
-                    except:
-                        pass
-                elif current_initial_score is not None:
-                    # If no final rating, assume score is unchanged
-                    final_scores.append(current_initial_score)
             
-            if not initial_scores:
-                if keyword_match_count <= 5:
-                    print(f"DEBUG: No scores found for {forum_id}")
+            if not current_scores:
                 continue
                 
-            avg_initial_score = statistics.mean(initial_scores)
-            min_initial_score = min(initial_scores)
+            avg_score = statistics.mean(current_scores)
+            min_score = min(current_scores)
             
-            avg_final_score = statistics.mean(final_scores) if final_scores else avg_initial_score
+            # C. Check for "Raised Score" evidence in discussion threads
+            evidence = []
+            for reply in all_forum_notes:
+                # Check content for keywords. 
+                # We check all text fields in content to be safe (comment, review, etc.)
+                content_values = []
+                for v in reply.content.values():
+                    if isinstance(v, dict) and 'value' in v:
+                        content_values.append(str(v['value']))
+                    elif isinstance(v, str):
+                        content_values.append(v)
+                
+                content_text = " ".join(content_values).lower()
+                
+                for kw in positive_keywords:
+                    if kw in content_text:
+                        # Found evidence!
+                        # Extract a snippet around the keyword
+                        idx = content_text.find(kw)
+                        start = max(0, idx - 50)
+                        end = min(len(content_text), idx + 150)
+                        snippet = content_text[start:end].replace('\n', ' ')
+                        evidence.append(f"...{snippet}...")
+                        break
 
-            # C. Core filtering criteria: Find "Turnaround" examples
-            # Condition 1: Average score below 6 (Borderline, saved by Rebuttal)
-            # Condition 2: Although average is okay, there is a very low score (<=4), indicating author successfully rebutted that reviewer
-            # We use INITIAL scores to find papers that started low
-            is_controversial = avg_initial_score < 6.0 or min_initial_score <= 4
+            # D. Filtering criteria
+            # 1. Explicit evidence of score raise (Turnaround)
+            # 2. Low average score (< 6) but accepted (Borderline/Saved)
+            # 3. Very low minimum score (<= 3) but accepted (Controversial)
             
-            if is_controversial:
+            has_turnaround_evidence = len(evidence) > 0
+            is_borderline = avg_score < 6.0
+            is_controversial = min_score <= 3
+            
+            if has_turnaround_evidence or is_borderline or is_controversial:
                 score_match_count += 1
+                
+                # Get Meta Review Info
+                meta_recommendation = "N/A"
+                meta_confidence = "N/A"
+                if meta_reviews:
+                    mr = meta_reviews[0]
+                    meta_recommendation = mr.content.get('recommendation', {}).get('value', 'N/A')
+                    meta_confidence = mr.content.get('confidence', {}).get('value', 'N/A')
+
                 results.append({
                     'title': note.content.get('title', {}).get('value', ''),
                     'url': f"https://openreview.net/forum?id={forum_id}",
-                    'avg_initial': round(avg_initial_score, 2),
-                    'avg_final': round(avg_final_score, 2),
-                    'initial_scores': sorted(initial_scores),
-                    'final_scores': sorted(final_scores),
-                    'keywords': 'Diffusion + NLP'
+                    'avg_score': round(avg_score, 2),
+                    'scores': sorted(current_scores),
+                    'meta_recommendation': meta_recommendation,
+                    'meta_confidence': meta_confidence,
+                    'evidence': evidence,
+                    'type': 'Turnaround' if has_turnaround_evidence else 'Borderline/Controversial'
                 })
+
                 
         except Exception as e:
             # print(f"Error processing {note.id}: {e}")
             continue
 
     if reviews_cache_updated:
-        save_cache(reviews_cache, 'reviews_cache_v2.pkl')
+        save_cache(reviews_cache, 'reviews_cache_v4.pkl')
 
     print(f"\nKeyword matches: {keyword_match_count}")
     print(f"Score matches: {score_match_count}")
 
-    # 4. Output results, sorted by score from low to high (lower score means harder Rebuttal, higher learning value)
-    results.sort(key=lambda x: x['avg_initial'])
+    # 4. Output results, sorted by number of raised scores (descending), then by score (ascending)
+    results.sort(key=lambda x: (-len(x['evidence']), x['avg_score']))
     
     print("\n" + "="*60)
-    print(f"Filtering complete! Found {len(results)} highly valuable Rebuttal examples:")
+    print(f"Filtering complete! Found {len(results)} highly valuable Rebuttal examples.")
+    print(f"Saving results to rebuttal_candidates.csv")
     print("="*60 + "\n")
     
-    for idx, p in enumerate(results):
-        print(f"{idx+1}. [Avg Initial {p['avg_initial']} -> Final {p['avg_final']}]")
-        print(f"   Initial Dist: {p['initial_scores']}")
-        print(f"   Final Dist:   {p['final_scores']}")
-        print(f"   Title: {p['title']}")
-        print(f"   Link: {p['url']}")
-        print("   Suggestion: Check how the author responded to the low-score reviewer")
-        print("-" * 30)
+    with open('rebuttal_candidates.csv', 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['Title', 'URL', 'Avg Score', 'Scores', 'Raise Count', 'Type', 'Meta Recommendation', 'Meta Confidence', 'Evidence']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for p in results:
+            writer.writerow({
+                'Title': p['title'],
+                'URL': p['url'],
+                'Avg Score': p['avg_score'],
+                'Scores': str(p['scores']),
+                'Raise Count': len(p['evidence']),
+                'Type': p['type'],
+                'Meta Recommendation': p['meta_recommendation'],
+                'Meta Confidence': p['meta_confidence'],
+                'Evidence': " || ".join(p['evidence'])
+            })
+            
+    print("Done! Check rebuttal_candidates.csv")
 
 
 if __name__ == "__main__":
