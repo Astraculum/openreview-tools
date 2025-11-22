@@ -22,68 +22,68 @@ def save_cache(data, name):
         pickle.dump(data, f)
 
 def find_rebuttal_examples():
-    # 1. 初始化客户端 (连接到 API V2)
+    # 1. Initialize client (connect to API V2)
     client = openreview.api.OpenReviewClient(baseurl='https://api2.openreview.net')
     
-    print("正在连接 ICLR 2024 数据仓库...")
+    print("Connecting to ICLR 2025 repository...")
     
-    # 2. 获取所有接收(Accept)的论文
-    # 尝试从缓存加载 submissions
+    # 2. Get all Accepted papers
+    # Try to load submissions from cache
     submissions = load_cache('submissions.pkl')
     if not submissions:
-        # ICLR 2024 的 Submission 包含 decision 信息，我们需要筛选 venueid 包含 Accept 的
+        # ICLR 2025 Submissions contain decision info, we need to filter for venueid containing Accept
         submissions = client.get_all_notes(
-            invitation='ICLR.cc/2024/Conference/-/Submission',
-            details='directReplies' # 获取回复以计算分数
+            invitation='ICLR.cc/2025/Conference/-/Submission',
+            details='directReplies' # Get replies to calculate scores
         )
         save_cache(submissions, 'submissions.pkl')
     
     accepted_papers = []
-    print(f"共获取 {len(submissions)} 篇投稿，正在筛选接收论文...")
+    print(f"Retrieved {len(submissions)} submissions, filtering for accepted papers...")
     
     for note in submissions:
-        # 检查 venue 是否为接收状态 (Accept (Poster/Oral/Spotlight))
+        # Check if venue status is Accept (Accept (Poster/Oral/Spotlight))
         venue = note.content.get('venue', {}).get('value', '')
         venue_id = note.content.get('venueid', {}).get('value', '')
         
-        # ICLR 2024 Accepted papers have venueid 'ICLR.cc/2024/Conference' 
+        # ICLR 2025 Accepted papers have venueid 'ICLR.cc/2025/Conference' 
         # or venue containing 'poster', 'spotlight', 'oral'
-        if venue_id == 'ICLR.cc/2024/Conference' or \
+        if venue_id == 'ICLR.cc/2025/Conference' or \
            any(x in venue.lower() for x in ['poster', 'spotlight', 'oral']):
             accepted_papers.append(note)
 
-    print(f"共找到 {len(accepted_papers)} 篇接收论文。正在筛选【扩散语言模型】领域的争议文章...")
+    print(f"Found {len(accepted_papers)} accepted papers. Filtering for controversial papers in [Diffusion Language Models]...")
     print("-" * 60)
 
     results = []
     
-    # 加载 reviews 缓存
+    # Load reviews cache
     reviews_cache = load_cache('reviews_cache.pkl') or {}
     reviews_cache_updated = False
 
     keyword_match_count = 0
     score_match_count = 0
 
-    # 3. 遍历接收论文，进行关键词和分数筛选
+    # 3. Iterate through accepted papers, filter by keywords and scores
     for note in tqdm(accepted_papers):
         try:
-            # A. 关键词筛选 (领域：扩散语言模型/文本扩散)
+            # A. Keyword filtering (Domain: Diffusion Language Models/Text Diffusion)
             title = note.content.get('title', {}).get('value', '').lower()
             abstract = note.content.get('abstract', {}).get('value', '').lower()
             text_data = title + " " + abstract
             
-            # 必须包含 diffusion
+            # Must contain diffusion
             if 'diffusion' not in text_data:
                 continue
-            # 必须包含 语言/文本 相关词
+            # Must contain language/text related words
             if not any(kw in text_data for kw in ['language', 'text', 'transformer', 'llm', 'token']):
                 continue
             
             keyword_match_count += 1
 
-            # B. 获取分数
-            # 在 API V2 中，review 通常作为 directReplies 存在，或者需要单独 fetch
-            # 这里我们再次确认 review
+            # B. Get scores
+            # In API V2, reviews usually exist as directReplies, or need to be fetched separately
+            # Here we double check reviews
             forum_id = note.id
             
             if forum_id in reviews_cache:
@@ -91,31 +91,42 @@ def find_rebuttal_examples():
             else:
                 reviews = client.get_notes(
                     forum=forum_id, 
-                    invitation='ICLR.cc/2024/Conference/-/Official_Review'
+                    invitation='ICLR.cc/2025/Conference/-/Official_Review'
                 )
                 reviews_cache[forum_id] = reviews
                 reviews_cache_updated = True
             
+            if keyword_match_count <= 5:
+                print(f"DEBUG: Processing {forum_id}. Reviews count: {len(reviews)}")
+
             if not reviews:
                 continue
                 
             scores = []
             for review in reviews:
-                # ICLR 2024 评分格式通常为 "8: Strong Accept"，提取冒号前的数字
+                # ICLR 2025 rating format is usually "8: Strong Accept", extract number before colon
                 rating_str = review.content.get('rating', {}).get('value', '')
+                if keyword_match_count <= 5:
+                     print(f"DEBUG: id={forum_id} rating_str='{rating_str}'")
+
                 if rating_str:
-                    score = int(rating_str.split(':')[0])
-                    scores.append(score)
+                    try:
+                        score = int(rating_str.split(':')[0])
+                        scores.append(score)
+                    except:
+                        pass
             
             if not scores:
+                if keyword_match_count <= 5:
+                    print(f"DEBUG: No scores found for {forum_id}")
                 continue
                 
             avg_score = statistics.mean(scores)
             min_score = min(scores)
             
-            # C. 核心筛选标准：寻找“逆风翻盘”的样本
-            # 条件1: 均分低于 6 (处于边缘，靠 Rebuttal 救回)
-            # 条件2: 虽然均分还可以，但有一个非常低的分数 (<=4)，说明作者成功反驳了该审稿人
+            # C. Core filtering criteria: Find "Turnaround" examples
+            # Condition 1: Average score below 6 (Borderline, saved by Rebuttal)
+            # Condition 2: Although average is okay, there is a very low score (<=4), indicating author successfully rebutted that reviewer
             is_controversial = avg_score < 6.0 or min_score <= 4
             
             if is_controversial:
@@ -138,18 +149,18 @@ def find_rebuttal_examples():
     print(f"\nKeyword matches: {keyword_match_count}")
     print(f"Score matches: {score_match_count}")
 
-    # 4. 输出结果，按分数从低到高排序 (分数越低越难Rebuttal，学习价值越高)
+    # 4. Output results, sorted by score from low to high (lower score means harder Rebuttal, higher learning value)
     results.sort(key=lambda x: x['avg_score'])
     
     print("\n" + "="*60)
-    print(f"筛选完成！为您找到 {len(results)} 篇极具学习价值的 Rebuttal 范例：")
+    print(f"Filtering complete! Found {len(results)} highly valuable Rebuttal examples:")
     print("="*60 + "\n")
     
     for idx, p in enumerate(results):
-        print(f"{idx+1}. [均分 {p['avg_score']}] 分布: {p['scores']}")
-        print(f"   标题: {p['title']}")
-        print(f"   链接: {p['url']}")
-        print("   建议关注点: 查看作者如何回复那个打低分的审稿人")
+        print(f"{idx+1}. [Avg {p['avg_score']}] Dist: {p['scores']}")
+        print(f"   Title: {p['title']}")
+        print(f"   Link: {p['url']}")
+        print("   Suggestion: Check how the author responded to the low-score reviewer")
         print("-" * 30)
 
 if __name__ == "__main__":
