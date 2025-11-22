@@ -58,7 +58,7 @@ def find_rebuttal_examples():
     results = []
     
     # Load reviews cache
-    reviews_cache = load_cache('reviews_cache.pkl') or {}
+    reviews_cache = load_cache('reviews_cache_v2.pkl') or {}
     reviews_cache_updated = False
 
     keyword_match_count = 0
@@ -89,10 +89,10 @@ def find_rebuttal_examples():
             if forum_id in reviews_cache:
                 reviews = reviews_cache[forum_id]
             else:
-                reviews = client.get_notes(
-                    forum=forum_id, 
-                    invitation='ICLR.cc/2025/Conference/-/Official_Review'
-                )
+                # Fetch all notes in forum to find reviews
+                # We filter for notes that have 'Official_Review' in their invitation
+                all_notes = client.get_notes(forum=forum_id)
+                reviews = [n for n in all_notes if any('Official_Review' in inv for inv in n.invitations)]
                 reviews_cache[forum_id] = reviews
                 reviews_cache_updated = True
             
@@ -102,40 +102,66 @@ def find_rebuttal_examples():
             if not reviews:
                 continue
                 
-            scores = []
+            initial_scores = []
+            final_scores = []
+
             for review in reviews:
                 # ICLR 2025 rating format is usually "8: Strong Accept", extract number before colon
-                rating_str = review.content.get('rating', {}).get('value', '')
-                if keyword_match_count <= 5:
-                     print(f"DEBUG: id={forum_id} rating_str='{rating_str}'")
+                # Initial Rating
+                rating_val = review.content.get('rating', {}).get('value', '')
+                rating_str = str(rating_val) if rating_val is not None else ''
+                
+                # Final Rating (Post-Rebuttal)
+                final_rating_val = review.content.get('final_rating', {}).get('value', '')
+                final_rating_str = str(final_rating_val) if final_rating_val is not None else ''
 
+                if keyword_match_count <= 5:
+                     print(f"DEBUG: id={forum_id} rating='{rating_str}' final='{final_rating_str}'")
+
+                current_initial_score = None
                 if rating_str:
                     try:
-                        score = int(rating_str.split(':')[0])
-                        scores.append(score)
+                        # Handle "8: Strong Accept" or just "8"
+                        current_initial_score = int(rating_str.split(':')[0])
+                        initial_scores.append(current_initial_score)
                     except:
                         pass
+                
+                if final_rating_str:
+                    try:
+                        score = int(final_rating_str.split(':')[0])
+                        final_scores.append(score)
+                    except:
+                        pass
+                elif current_initial_score is not None:
+                    # If no final rating, assume score is unchanged
+                    final_scores.append(current_initial_score)
             
-            if not scores:
+            if not initial_scores:
                 if keyword_match_count <= 5:
                     print(f"DEBUG: No scores found for {forum_id}")
                 continue
                 
-            avg_score = statistics.mean(scores)
-            min_score = min(scores)
+            avg_initial_score = statistics.mean(initial_scores)
+            min_initial_score = min(initial_scores)
             
+            avg_final_score = statistics.mean(final_scores) if final_scores else avg_initial_score
+
             # C. Core filtering criteria: Find "Turnaround" examples
             # Condition 1: Average score below 6 (Borderline, saved by Rebuttal)
             # Condition 2: Although average is okay, there is a very low score (<=4), indicating author successfully rebutted that reviewer
-            is_controversial = avg_score < 6.0 or min_score <= 4
+            # We use INITIAL scores to find papers that started low
+            is_controversial = avg_initial_score < 6.0 or min_initial_score <= 4
             
             if is_controversial:
                 score_match_count += 1
                 results.append({
                     'title': note.content.get('title', {}).get('value', ''),
                     'url': f"https://openreview.net/forum?id={forum_id}",
-                    'avg_score': round(avg_score, 2),
-                    'scores': sorted(scores),
+                    'avg_initial': round(avg_initial_score, 2),
+                    'avg_final': round(avg_final_score, 2),
+                    'initial_scores': sorted(initial_scores),
+                    'final_scores': sorted(final_scores),
                     'keywords': 'Diffusion + NLP'
                 })
                 
@@ -144,24 +170,27 @@ def find_rebuttal_examples():
             continue
 
     if reviews_cache_updated:
-        save_cache(reviews_cache, 'reviews_cache.pkl')
+        save_cache(reviews_cache, 'reviews_cache_v2.pkl')
 
     print(f"\nKeyword matches: {keyword_match_count}")
     print(f"Score matches: {score_match_count}")
 
     # 4. Output results, sorted by score from low to high (lower score means harder Rebuttal, higher learning value)
-    results.sort(key=lambda x: x['avg_score'])
+    results.sort(key=lambda x: x['avg_initial'])
     
     print("\n" + "="*60)
     print(f"Filtering complete! Found {len(results)} highly valuable Rebuttal examples:")
     print("="*60 + "\n")
     
     for idx, p in enumerate(results):
-        print(f"{idx+1}. [Avg {p['avg_score']}] Dist: {p['scores']}")
+        print(f"{idx+1}. [Avg Initial {p['avg_initial']} -> Final {p['avg_final']}]")
+        print(f"   Initial Dist: {p['initial_scores']}")
+        print(f"   Final Dist:   {p['final_scores']}")
         print(f"   Title: {p['title']}")
         print(f"   Link: {p['url']}")
         print("   Suggestion: Check how the author responded to the low-score reviewer")
         print("-" * 30)
+
 
 if __name__ == "__main__":
     find_rebuttal_examples()
